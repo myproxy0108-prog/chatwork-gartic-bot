@@ -170,19 +170,19 @@ async function handleGarticAlbum(roomId, targetUrl) {
     const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       acceptDownloads: true,
-      locale: 'ja-JP' // 確実に日本語UIにする
+      locale: 'ja-JP'
     });
     const page = await context.newPage();
 
-    // 1. ページを開く
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     let joinConfirmed = false;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
 
-    // 2. 【改善】UI(入力欄)が描画されるまで確実に待つ (最大30秒)
     try {
       await page.waitForSelector('input', { state: 'visible', timeout: 30000 });
-      await page.waitForTimeout(1000); // 描画安定待機
+      await page.waitForTimeout(1000); 
 
       // クッキー同意ダイアログ等
       const consentBtn = await page.$('button:has-text("Consent"), button:has-text("Accept"), button:has-text("同意"), button:has-text("AGREE")');
@@ -191,49 +191,49 @@ async function handleGarticAlbum(roomId, targetUrl) {
         await page.waitForTimeout(500);
       }
 
-      // 3. 【改善】ニックネームを確実に入力してEnterを押す
-      const nameInput = await page.$('input');
-      if (nameInput && await nameInput.isVisible()) {
-        // 元々入っている名前を全選択して上書き
-        await nameInput.click({ clickCount: 3 });
-        await page.keyboard.press('Backspace');
-        await nameInput.fill('AlbumBot');
-        await page.waitForTimeout(500);
+      // 【改善】入室を数回リトライし、ダメなら諦める
+      while (retryCount < MAX_RETRIES && !joinConfirmed) {
+        retryCount++;
+        console.log(`入室試行: ${retryCount}回目`);
 
-        // Enterキーで参加（一番確実）
-        await nameInput.press('Enter');
-        console.log('Enterキーを押下して参加処理を行いました');
-        await page.waitForTimeout(1500);
+        const nameInput = await page.$('input');
+        if (nameInput && await nameInput.isVisible()) {
+          await nameInput.click({ clickCount: 3 });
+          await page.keyboard.press('Backspace');
+          await nameInput.fill('AlbumBot');
+          await page.waitForTimeout(500);
 
-        // もしEnterで進まなかった場合は、開始ボタンを探してクリック
-        if (await nameInput.isVisible()) {
-          const startButtonSelectors = [
-            'button:has-text("開始")',
-            'button:has-text("Start")',
-            'button:has-text("Play")',
-            'button.primary',
-            'button.bt-start',
-            'button[type="submit"]'
-          ];
-          for (const selector of startButtonSelectors) {
-            const btn = await page.$(selector);
-            if (btn && await btn.isVisible()) {
-              await btn.click();
-              console.log(`開始ボタンをクリックしました: ${selector}`);
-              break;
+          await nameInput.press('Enter');
+          await page.waitForTimeout(1500);
+
+          if (await nameInput.isVisible()) {
+            const startButtonSelectors = [
+              'button:has-text("開始")',
+              'button:has-text("Start")',
+              'button:has-text("Play")',
+              'button.primary',
+              'button.bt-start',
+              'button[type="submit"]'
+            ];
+            for (const selector of startButtonSelectors) {
+              const btn = await page.$(selector);
+              if (btn && await btn.isVisible()) {
+                await btn.click();
+                break;
+              }
             }
           }
-        }
 
-        // 4. 【改善】入力欄が消えたか（＝確実に入室できたか）を確認
-        try {
-          await page.waitForFunction(() => {
-            const inputs = Array.from(document.querySelectorAll('input'));
-            return inputs.every(el => el.offsetParent === null); // すべてのinputが非表示になればOK
-          }, { timeout: 10000 });
-          joinConfirmed = true;
-        } catch (_) {
-          joinConfirmed = false;
+          // 入力欄が消えたか（＝確実に入室できたか）を確認
+          try {
+            await page.waitForFunction(() => {
+              const inputs = Array.from(document.querySelectorAll('input'));
+              return inputs.every(el => el.offsetParent === null); 
+            }, { timeout: 5000 });
+            joinConfirmed = true;
+          } catch (_) {
+            joinConfirmed = false;
+          }
         }
       }
     } catch (e) {
@@ -244,10 +244,11 @@ async function handleGarticAlbum(roomId, targetUrl) {
     if (joinConfirmed) {
       await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を監視中...');
     } else {
-      await sendCwMessage(roomId, '[警告] 画面の読み込みが間に合わなかったか、開始ボタンが効きませんでした。Botが入室できていない可能性があります。（監視は一応継続します）');
+      // 【改善】失敗時は即座に処理を中断する（留まらない）
+      await sendCwMessage(roomId, '[エラー] 何度か入室を試みましたが、参加できませんでした。処理を中断し、退室します。');
+      return; 
     }
 
-    // 5. アルバムGIFの待機・ダウンロード処理
     const sentGifsHashes = new Set();
     const downloadedUrls = new Set();
     let isFinished = false;
@@ -270,7 +271,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
       }
     });
 
-    // 高速チェックループ
     while (!isFinished && checkCount < 600) { 
       checkCount++;
 
@@ -310,7 +310,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
         } catch (e) {}
       }
 
-      // 終了判定：アルバムが終わり、プレイヤーがロビーに戻ったか解散したかを判定
       try {
         const shouldFinish = await page.evaluate(() => {
           const bodyText = document.body.innerText.toUpperCase();
@@ -375,7 +374,7 @@ app.post('/webhook', (req, res) => {
       if (!messageId || !messageText || !roomId) return;
 
       if (messageText.includes('[info][title]')) return;
-      if (messageText.includes('[警告]')) return;
+      if (messageText.includes('[エラー]')) return;
 
       if (processedMessageIds.has(String(messageId))) return;
       processedMessageIds.add(String(messageId));
