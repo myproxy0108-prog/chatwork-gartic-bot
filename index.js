@@ -29,7 +29,9 @@ app.use(express.json({
 
 let currentGarticUrl = null;
 let isProcessing = false;
-const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
+
+// ja でも en でもマッチするように変更
+const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/(?:ja|en)\/[a-zA-Z0-9]{8}/;
 const processedMessageIds = new Set();
 const MAX_CACHE_SIZE = 1000;
 
@@ -85,9 +87,11 @@ async function getUrlFromDescription(roomId) {
     const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
       headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
     });
-    const match = (getRes.data.description || '').match(/\[Gartic Phone URL\]: (https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8})/);
+    // 概要欄からは必ず /ja/ (または一応 /en/) のURLを拾う
+    const match = (getRes.data.description || '').match(/\[Gartic Phone URL\]: (https?:\/\/[^\s]+\/(?:ja|en)\/[a-zA-Z0-9]{8})/);
     if (match) {
-      currentGarticUrl = match[1];
+      // メモリに乗せる時は必ず /ja/ の形に直して保持（人間の視界用）
+      currentGarticUrl = match[1].replace(/\/(ja|en)\//, '/ja/');
       return currentGarticUrl;
     }
   } catch (err) {
@@ -156,7 +160,6 @@ async function sendCwFile(roomId, filePath, caption = '') {
 // 安全にスクショを撮る関数（タイムアウト対策）
 async function safeScreenshot(page, savePath) {
   try {
-    // スクショ撮影に5秒の制限時間を設け、フリーズを防ぐ
     await page.screenshot({ path: savePath, timeout: 5000 });
     return true;
   } catch (e) {
@@ -168,7 +171,11 @@ async function safeScreenshot(page, savePath) {
 // Gartic Phoneのアルバム取得メイン処理
 async function handleGarticAlbum(roomId, targetUrl) {
   isProcessing = true;
-  console.log(`Gartic Phone処理開始: ${targetUrl}`);
+  
+  // 【超重要】Botがアクセスする時は文字化け（豆腐）を防ぐためにURLを強制的に /en/ に変換する！
+  const enUrl = targetUrl.replace(/\/(ja|en)\//, '/en/');
+  
+  console.log(`Gartic Phone処理開始: ${targetUrl} (※Botは英語UI ${enUrl} でアクセスします)`);
   await sendCwMessage(roomId, `[info][title]Gartic Phone[/title]ルームへ接続を開始します...\nURL: ${targetUrl}[/info]`);
 
   let browser;
@@ -188,21 +195,25 @@ async function handleGarticAlbum(roomId, targetUrl) {
     const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       acceptDownloads: true,
+      // 英語のUIを引き出すために言語をen-USに設定
+      locale: 'en-US',
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     });
     const page = await context.newPage();
 
-    // 【重要】ブラウザのポップアップダイアログは全て即座に「はい(Accept)」する
+    // 【GIFダウンロード強化】ブラウザのポップアップダイアログは全て即座に「はい(Accept)」する
+    // 英語環境だと「Download the image?」等になりますが、問答無用で承認します。
     page.on('dialog', async dialog => {
       try {
-        console.log(`ダイアログ出現: ${dialog.type()} -> 自動承認します`);
+        console.log(`ダイアログ出現: ${dialog.message()} -> 即座に自動承認します`);
         await dialog.accept();
       } catch (e) {
         console.error('ダイアログ承認中にエラー:', e.message);
       }
     });
 
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // 変換した英語のURLにアクセス
+    await page.goto(enUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     let joinConfirmed = false;
     let retryCount = 0;
@@ -214,6 +225,13 @@ async function handleGarticAlbum(roomId, targetUrl) {
       await nameInput.waitFor({ state: 'visible', timeout: 30000 });
       await page.waitForTimeout(1000); 
 
+      // 英語UIのため、同意ボタンは確実に「Consent」「Accept」になるので押しやすい
+      const consentBtn = page.locator('button').filter({ hasText: /Consent|Accept|AGREE/i }).first();
+      if (await consentBtn.isVisible().catch(() => false)) {
+        await consentBtn.click();
+        await page.waitForTimeout(500);
+      }
+
       while (retryCount < MAX_RETRIES && !joinConfirmed) {
         retryCount++;
         console.log(`入室試行: ${retryCount}回目`);
@@ -224,14 +242,14 @@ async function handleGarticAlbum(roomId, targetUrl) {
           await nameInput.fill('AlbumBot');
           await page.waitForTimeout(500);
 
-          // 【完全コード参照】文字に頼らず、HTML構造（type="submit"やクラス）で参加ボタンを特定
-          const joinBtn = page.locator('button[type="submit"], button.primary, .v-button--primary, form button').first();
+          // 英語UIになったので、文字化けせず確実に「Start」や「Play」が読める！
+          const joinBtn = page.locator('button, [role="button"]').filter({ hasText: /Start|Play/i }).first();
           
           if (await joinBtn.isVisible().catch(() => false)) {
             await joinBtn.click();
-            console.log('参加ボタン（構造指定）をクリックしました');
+            console.log('英語の「Start/Play」ボタンをクリックしました');
           } else {
-            // ボタンが見つからなければ最終手段のEnterキー
+            // 見つからなければEnterキー
             await nameInput.press('Enter');
             console.log('Enterキーを押下しました');
           }
@@ -254,7 +272,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
     if (joinConfirmed) {
       const joinedShot = path.join(__dirname, `joined_${Date.now()}.png`);
       if (await safeScreenshot(page, joinedShot)) {
-        await sendCwFile(roomId, joinedShot, 'Gartic Phoneへの参加を確認しました。監視中のBotの画面はこちらです。アルバム発表を待ちます...');
+        await sendCwFile(roomId, joinedShot, 'Gartic Phoneへの参加を確認しました。監視中のBotの画面はこちらです。(※文字化け対策のため英語モードで起動しています)');
         if(fs.existsSync(joinedShot)) fs.unlinkSync(joinedShot);
       } else {
         await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を待ちます...（※画面撮影はタイムアウトしました）');
@@ -274,7 +292,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
     let isFinished = false;
     let checkCount = 0;
 
-    // ダウンロード裏側待機イベント
+    // ダウンロード裏側待機イベント（ここでGIFが取得できれば一番安全）
     page.on('download', async (download) => {
       try {
         console.log('ダウンロードイベント検知！保存処理開始...');
@@ -297,7 +315,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
       checkCount++;
 
       try {
-        // 【完全コード参照】文字化けに影響されないように「.GIF」という英語文字列を含むボタンを探す
+        // 英語環境でもGIFボタンは「.GIF」なので確実に見つかる
         const gifButtons = page.locator('button').filter({ hasText: '.GIF' });
         const btnCount = await gifButtons.count();
 
@@ -305,7 +323,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
           const btn = gifButtons.nth(i);
           if (await btn.isVisible().catch(() => false)) {
             
-            // すでにクリック済みのボタンは無視する
+            // すでにクリック済みのボタンは無視する（連写防止）
             const isProcessed = await btn.evaluate(e => e.hasAttribute('data-bot-processed'));
             if (isProcessed) continue;
 
@@ -329,7 +347,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
         console.log('ボタン検索・クリック中エラー:', e.message);
       }
 
-      // 【完全コード参照】終了判定：URLが変わったか（ホームに戻ったか）だけで判定する
+      // 終了判定：URLがホームに戻ったか（英語UIの場合は /en に戻る）だけで判定する
       try {
         const isUrlChanged = await page.evaluate(() => {
           const path = window.location.pathname;
@@ -392,10 +410,10 @@ app.post('/webhook', (req, res) => {
         processedMessageIds.delete(processedMessageIds.values().next().value);
       }
 
-      // 1. URL登録処理
+      // 1. URL登録処理 (必ず/ja/に変換して概要へ)
       const match = messageText.match(GARTIC_URL_REGEX);
       if (match) {
-        currentGarticUrl = match[0];
+        currentGarticUrl = match[0].replace(/\/(ja|en)\//, '/ja/');
         await updateRoomDescription(roomId, currentGarticUrl);
       }
 
