@@ -10,9 +10,8 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 const CHATWORK_API_TOKEN = process.env.CHATWORK_API_TOKEN;
-const CHATWORK_WEBHOOK_TOKEN = process.env.CHATWORK_WEBHOOK_TOKEN; // 署名検証用トークン
+const CHATWORK_WEBHOOK_TOKEN = process.env.CHATWORK_WEBHOOK_TOKEN;
 
-// 署名検証用にRaw Bodyを保持しながらJSONパースする設定
 app.use(express.json({
   verify: (req, res, buf) => {
     req.rawBody = buf;
@@ -20,11 +19,15 @@ app.use(express.json({
 }));
 
 let currentGarticUrl = null;
+let isProcessing = false;
 const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
 
-// Webhookの署名（なりすまし防止）チェック関数
+// 【メッセージ重複防止】処理済みメッセージIDを記憶するSet
+const processedMessageIds = new Set();
+const MAX_CACHE_SIZE = 1000; // キャッシュ上限（メモリ肥大化防止）
+
 function isValidSignature(req) {
-  if (!CHATWORK_WEBHOOK_TOKEN) return true; // トークン未設定時はスキップ
+  if (!CHATWORK_WEBHOOK_TOKEN) return true;
 
   const signature = req.headers['x-chatworkwebhooksignature'];
   if (!signature || !req.rawBody) return false;
@@ -72,6 +75,7 @@ async function sendCwFile(roomId, filePath, caption = '') {
 }
 
 async function handleGarticAlbum(roomId, targetUrl) {
+  isProcessing = true;
   console.log(`Gartic Phone処理開始: ${targetUrl}`);
   await sendCwMessage(roomId, `[info][title]Gartic Phone[/title]参加処理を開始します...\nURL: ${targetUrl}[/info]`);
 
@@ -95,7 +99,8 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
     await sendCwMessage(roomId, 'Gartic Phoneに参加しました。アルバム（結果）を待機中...');
 
-    const downloadedGifs = new Set();
+    const sentGifsHashes = new Set();
+    const downloadedUrls = new Set();
     let isFinished = false;
     let checkCount = 0;
 
@@ -106,17 +111,27 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
       for (const el of downloadElements) {
         const href = await el.getAttribute('href');
-        if (href && href.includes('.gif') && !downloadedGifs.has(href)) {
-          downloadedGifs.add(href);
+        
+        if (href && href.includes('.gif') && !downloadedUrls.has(href)) {
+          downloadedUrls.add(href);
 
           const response = await page.request.get(href);
           const buffer = await response.body();
+
+          const hash = crypto.createHash('md5').update(buffer).digest('hex');
+          if (sentGifsHashes.has(hash)) {
+            console.log(`重複したGIF画像のため無視（スキップ）: ${hash}`);
+            continue;
+          }
+
+          sentGifsHashes.add(hash);
+
           const fileName = `gartic_${Date.now()}.gif`;
           const savePath = path.join(__dirname, fileName);
 
           fs.writeFileSync(savePath, buffer);
 
-          await sendCwFile(roomId, savePath, `アルバムGIFを取得しました (${downloadedGifs.size}作品目)`);
+          await sendCwFile(roomId, savePath, `アルバムGIFを取得しました (${sentGifsHashes.size}作品目)`);
 
           if (fs.existsSync(savePath)) {
             fs.unlinkSync(savePath);
@@ -125,38 +140,53 @@ async function handleGarticAlbum(roomId, targetUrl) {
       }
 
       const endElement = await page.$('.exit, .finish, button:has-text("ロビーに戻る"), button:has-text("Home")');
-      if (endElement && downloadedGifs.size > 0) {
+      if (endElement && sentGifsHashes.size > 0) {
         isFinished = true;
       }
 
       await page.waitForTimeout(3000);
     }
 
-    await sendCwMessage(roomId, `[info][title]完了[/title]全員のアルバム取得が完了しました。Botは退室します。（計 ${downloadedGifs.size}件）[/info]`);
+    await sendCwMessage(roomId, `[info][title]完了[/title]全員のアルバム取得が完了しました。Botは退室します。（計 ${sentGifsHashes.size}件）[/info]`);
 
   } catch (error) {
     console.error('エラー:', error);
     await sendCwMessage(roomId, `エラーが発生しました: ${error.message}`);
   } finally {
     await browser.close();
+    isProcessing = false;
   }
 }
 
 app.post('/webhook', async (req, res) => {
-  // 1. Webhookの署名検証（なりすましリクエストを拒否）
   if (!isValidSignature(req)) {
     console.warn('不正なWebhook署名を検出したため拒否しました');
     return res.status(401).send('Unauthorized');
   }
 
-  // 即時レスポンスを返却
+  // 即時レスポンス返却
   res.status(200).send('OK');
 
   const webhookData = req.body;
-  const messageText = webhookData.webhook_event?.body;
-  const roomId = webhookData.webhook_event?.room_id;
+  const webhookEvent = webhookData.webhook_event;
+  const messageId = webhookEvent?.message_id;
+  const messageText = webhookEvent?.body;
+  const roomId = webhookEvent?.room_id;
 
-  if (!messageText || !roomId) return;
+  if (!messageId || !messageText || !roomId) return;
+
+  // 【重複防止】同じメッセージIDを既に処理していたらスキップ
+  if (processedMessageIds.has(messageId)) {
+    console.log(`重複メッセージのため無視しました: message_id=${messageId}`);
+    return;
+  }
+
+  // メッセージIDを記録（古くなったIDは削除してメモリ肥大化を防止）
+  processedMessageIds.add(messageId);
+  if (processedMessageIds.size > MAX_CACHE_SIZE) {
+    const firstItem = processedMessageIds.values().next().value;
+    processedMessageIds.delete(firstItem);
+  }
 
   // URLの検知と設定
   const match = messageText.match(GARTIC_URL_REGEX);
@@ -168,6 +198,11 @@ app.post('/webhook', async (req, res) => {
 
   // 「開示」コマンドの判定
   if (messageText.trim() === '開示') {
+    if (isProcessing) {
+      await sendCwMessage(roomId, '現在すでに「開示」処理を実行中です。完了までお待ちください。');
+      return;
+    }
+
     if (!currentGarticUrl) {
       await sendCwMessage(roomId, 'URLが設定されていません。先にGartic PhoneのURLを送信してください。');
       return;
