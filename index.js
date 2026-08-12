@@ -1,10 +1,14 @@
 const express = require('express');
 const axios = require('axios');
 const FormData = require('form-data');
-const { chromium } = require('playwright');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+
+// 【ステルス化】Botだとバレないための拡張機能を読み込む
+const { chromium } = require('playwright-extra');
+const stealth = require('puppeteer-extra-plugin-stealth')();
+chromium.use(stealth);
 
 const app = express();
 
@@ -149,7 +153,6 @@ async function sendCwFile(roomId, filePath, caption = '') {
   }
 }
 
-// Gartic Phoneのアルバム取得メイン処理
 async function handleGarticAlbum(roomId, targetUrl) {
   isProcessing = true;
   console.log(`Gartic Phone処理開始: ${targetUrl}`);
@@ -164,14 +167,17 @@ async function handleGarticAlbum(roomId, targetUrl) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
-        '--window-size=1280,720'
+        '--window-size=1280,720',
+        '--disable-blink-features=AutomationControlled' // 自動化ソフトであることを隠蔽
       ]
     });
 
     const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       acceptDownloads: true,
-      locale: 'ja-JP'
+      locale: 'ja-JP',
+      // 人間が使っているWindows PCのChromeのフリをする
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     });
     const page = await context.newPage();
 
@@ -182,12 +188,10 @@ async function handleGarticAlbum(roomId, targetUrl) {
     const MAX_RETRIES = 3;
 
     try {
-      // 確実な要素待機機能（Locator）を使用
       const nameInput = page.locator('input').first();
       await nameInput.waitFor({ state: 'visible', timeout: 30000 });
       await page.waitForTimeout(1000); 
 
-      // 同意ダイアログがあれば押す
       const consentBtn = page.locator('button').filter({ hasText: /Consent|Accept|同意|AGREE/i }).first();
       if (await consentBtn.isVisible().catch(() => false)) {
         await consentBtn.click();
@@ -199,13 +203,11 @@ async function handleGarticAlbum(roomId, targetUrl) {
         console.log(`入室試行: ${retryCount}回目`);
 
         if (await nameInput.isVisible().catch(() => false)) {
-          // 入力欄をクリアしてBot名を入力
           await nameInput.click({ clickCount: 3 });
           await page.keyboard.press('Backspace');
           await nameInput.fill('AlbumBot');
           await page.waitForTimeout(500);
 
-          // 画像に合わせて「参加」や「開始」ボタンを探す
           const joinBtn = page.locator('button, [role="button"]').filter({ hasText: /参加|開始|Start|Play/i }).first();
           if (await joinBtn.isVisible().catch(() => false)) {
             await joinBtn.click();
@@ -215,21 +217,19 @@ async function handleGarticAlbum(roomId, targetUrl) {
             console.log('Enterキーを押下しました');
           }
 
-          // 【超重要】ボタン押下後、一瞬の暗転に騙されないよう2秒待ってから判定する
           await page.waitForTimeout(2000);
           
           if (!(await nameInput.isVisible().catch(() => false))) {
-            joinConfirmed = true; // 本当に入力欄が消えたので成功
+            joinConfirmed = true; 
           }
         } else {
-          joinConfirmed = true; // すでに消えていたら成功
+          joinConfirmed = true; 
         }
       }
     } catch (e) {
       console.log('入力欄の待機タイムアウト、またはエラー:', e.message);
     }
 
-    // 【新規】Botの現在の視界（スクショ）を送信して状況を証拠として送る
     if (joinConfirmed) {
       const joinedShot = path.join(__dirname, `joined_${Date.now()}.png`);
       await page.screenshot({ path: joinedShot });
@@ -247,7 +247,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
     let isFinished = false;
     let checkCount = 0;
 
-    // ダウンロード裏側待機イベント
     page.on('download', async (download) => {
       try {
         const downloadPath = path.join(__dirname, `gartic_dl_${Date.now()}.gif`);
@@ -274,22 +273,18 @@ async function handleGarticAlbum(roomId, targetUrl) {
         try {
           if (!(await el.isVisible())) continue;
 
-          // すでに処理・スクショしたボタンかはマーカーで判定
           const isProcessed = await el.evaluate(e => e.hasAttribute('data-bot-processed'));
           if (isProcessed) continue;
 
           console.log('新しいGIFボタンを発見しました。スクショとダウンロードを開始します。');
 
-          // 1. まず画面のスクリーンショットを撮って送信する
           const screenshotPath = path.join(__dirname, `screenshot_${Date.now()}.png`);
           await page.screenshot({ path: screenshotPath });
           await sendCwFile(roomId, screenshotPath, `[info]スクリーンショット[/info]`);
           if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
 
-          // 2. ボットが処理したという目印（マーカー）をボタンに付ける
           await el.evaluate(e => e.setAttribute('data-bot-processed', 'true'));
 
-          // 3. GIFのダウンロードを実行する
           const href = await el.getAttribute('href');
           if (href && href.includes('.gif')) {
             const absoluteHref = /^https?:\/\//i.test(href) ? href : new URL(href, page.url()).toString();
@@ -305,7 +300,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
               if (fs.existsSync(savePath)) fs.unlinkSync(savePath);
             }
           } else {
-            // hrefがない場合（.GIFボタン）はクリックしてダウンロードを誘発する
             const tagName = await el.evaluate(e => e.tagName.toLowerCase());
             if (tagName === 'button') {
               await el.click({ timeout: 1000 }).catch(() => {});
@@ -314,7 +308,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
         } catch (e) {}
       }
 
-      // 終了判定（ロビー帰還・ホーム帰還・切断検知）
       try {
         const shouldFinish = await page.evaluate(() => {
           const bodyText = document.body.innerText.toUpperCase();
