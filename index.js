@@ -20,11 +20,24 @@ app.use(express.json({
 
 let currentGarticUrl = null;
 let isProcessing = false;
-const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
+let botAccountId = null; // 【追加】Bot自身のAccount IDを保持
 
-// 【メッセージ重複防止】処理済みメッセージIDを記憶するSet
+const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
 const processedMessageIds = new Set();
-const MAX_CACHE_SIZE = 1000; // キャッシュ上限（メモリ肥大化防止）
+const MAX_CACHE_SIZE = 1000;
+
+// 【追加】Bot自身のAccount IDをAPIから自動取得する関数
+async function fetchBotAccountId() {
+  try {
+    const res = await axios.get('https://api.chatwork.com/v2/me', {
+      headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
+    });
+    botAccountId = res.data.account_id;
+    console.log(`Bot Account ID 取得成功: ${botAccountId}`);
+  } catch (err) {
+    console.error('Bot Account ID 取得失敗:', err.response?.data || err.message);
+  }
+}
 
 function isValidSignature(req) {
   if (!CHATWORK_WEBHOOK_TOKEN) return true;
@@ -120,7 +133,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
           const hash = crypto.createHash('md5').update(buffer).digest('hex');
           if (sentGifsHashes.has(hash)) {
-            console.log(`重複したGIF画像のため無視（スキップ）: ${hash}`);
+            console.log(`重複したGIF画像のため無視: ${hash}`);
             continue;
           }
 
@@ -164,7 +177,6 @@ app.post('/webhook', async (req, res) => {
     return res.status(401).send('Unauthorized');
   }
 
-  // 即時レスポンス返却
   res.status(200).send('OK');
 
   const webhookData = req.body;
@@ -172,16 +184,25 @@ app.post('/webhook', async (req, res) => {
   const messageId = webhookEvent?.message_id;
   const messageText = webhookEvent?.body;
   const roomId = webhookEvent?.room_id;
+  const fromAccountId = webhookEvent?.from_account_id; // 【追加】送信者ID
 
   if (!messageId || !messageText || !roomId) return;
 
-  // 【重複防止】同じメッセージIDを既に処理していたらスキップ
-  if (processedMessageIds.has(messageId)) {
-    console.log(`重複メッセージのため無視しました: message_id=${messageId}`);
+  // 【自己応答防止】送信者がBot自身の場合は無視する
+  if (botAccountId && fromAccountId === botAccountId) {
     return;
   }
 
-  // メッセージIDを記録（古くなったIDは削除してメモリ肥大化を防止）
+  // 【自己応答防止】Bot特有のシステムメッセージタグが含まれる場合も無視する
+  if (messageText.includes('[title]URL設定[/title]') || messageText.includes('[title]Gartic Phone[/title]')) {
+    return;
+  }
+
+  // 【重複防止】すでに処理済みのメッセージIDの場合は無視する
+  if (processedMessageIds.has(messageId)) {
+    return;
+  }
+
   processedMessageIds.add(messageId);
   if (processedMessageIds.size > MAX_CACHE_SIZE) {
     const firstItem = processedMessageIds.values().next().value;
@@ -212,6 +233,7 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Server listening on port ${PORT}`);
+  await fetchBotAccountId(); // 起動時にBotのアカウントIDを取得
 });
