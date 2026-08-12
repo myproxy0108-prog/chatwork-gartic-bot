@@ -99,8 +99,8 @@ async function getUrlFromDescription(roomId) {
   return null;
 }
 
-// 概要の最上部を書き換える
-async function updateRoomDescription(roomId, newUrl) {
+// 概要の最上部を書き換える（URLに限らず、完了時の「今は開始していません！」なども同じ関数で書き換える）
+async function updateRoomDescription(roomId, newContent) {
   try {
     const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
       headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
@@ -111,13 +111,14 @@ async function updateRoomDescription(roomId, newUrl) {
     const beforeIds = await fetchRecentMessageIds(roomId);
 
     const currentDesc = getRes.data.description || '';
-    const regex = /\[Gartic Phone URL\]: https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}\n?/g;
-    const newLine = `[Gartic Phone URL]: ${newUrl}\n`;
+    // 「[Gartic Phone URL]: 」で始まる行は内容を問わず(URLでもプレースホルダーの文言でも)対象にする
+    const regex = /\[Gartic Phone URL\]: .*\n?/g;
+    const newLine = `[Gartic Phone URL]: ${newContent}\n`;
 
-    // 既存のURL行は（どこにあっても）一旦取り除き、本文はそのまま保持したうえで
-    // 新しいURLを必ず一番上に追記する
-    const bodyWithoutOldUrl = currentDesc.replace(regex, '');
-    const updatedDesc = newLine + bodyWithoutOldUrl;
+    // 既存の行は（どこにあっても）一旦取り除き、本文はそのまま保持したうえで
+    // 新しい内容を必ず一番上に追記する
+    const bodyWithoutOldLine = currentDesc.replace(regex, '');
+    const updatedDesc = newLine + bodyWithoutOldLine;
 
     await axios.put(`https://api.chatwork.com/v2/rooms/${roomId}`,
       new URLSearchParams({ description: updatedDesc }),
@@ -350,6 +351,10 @@ async function handleGarticAlbum(roomId, targetUrl) {
     }
 
     await sendCwMessage(roomId, `[info][title]完了[/title]全員のアルバム取得が完了しました。Botは退室します。（合計 ${sentGifsHashes.size}件）[/info]`);
+
+    // お開き（完了）になったので、概要のURL部分を「今は開始していません！」に書き換える
+    currentGarticUrl = null;
+    await updateRoomDescription(roomId, '今は開始していません！');
 
   } catch (error) {
     console.error('Gartic操作エラー:', error);
