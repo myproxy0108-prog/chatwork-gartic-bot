@@ -18,17 +18,8 @@ app.use(express.json({
   }
 }));
 
-const URL_STORE_PATH = path.join(__dirname, 'current_url.txt');
+// メモリ上のURL。Render再起動で消滅するため、概要(Description)から復元する設計に変更
 let currentGarticUrl = null;
-
-if (fs.existsSync(URL_STORE_PATH)) {
-  try {
-    currentGarticUrl = fs.readFileSync(URL_STORE_PATH, 'utf-8').trim() || null;
-  } catch (e) {
-    console.error('URL読み込みエラー:', e);
-  }
-}
-
 let isProcessing = false;
 const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
 const processedMessageIds = new Set();
@@ -44,44 +35,68 @@ function isValidSignature(req) {
   return signature === expectedSignature;
 }
 
-// 【新規追加】ルームの概要(Description)を更新する関数
+// 【追加】ルームの概要からURLを読み取って復元する関数
+async function getUrlFromDescription(roomId) {
+  if (currentGarticUrl) return currentGarticUrl; // メモリに残っていればそのまま使用
+
+  try {
+    const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
+      headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
+    });
+    const currentDesc = getRes.data.description || '';
+    
+    // 概要欄からURLを抽出
+    const match = currentDesc.match(/\[Gartic Phone URL\]: (https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8})/);
+    if (match) {
+      currentGarticUrl = match[1];
+      console.log(`概要からURLを復元しました: ${currentGarticUrl}`);
+      return currentGarticUrl;
+    }
+  } catch (err) {
+    console.error('ルーム情報取得エラー', err.message);
+  }
+  return null;
+}
+
+// 【改善】ルームの概要(Description)を更新する関数
 async function updateRoomDescription(roomId, newUrl) {
   try {
-    // 現在のルーム情報を取得
     const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
       headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
     });
     
-    // グループチャット以外（マイチャット等）は概要が変更できない場合があるので除外
-    if (getRes.data.type !== 'group') {
-      console.log('グループチャットではないため概要の更新をスキップします');
+    // マイチャット対策
+    if (getRes.data.type === 'my') {
+      await sendCwMessage(roomId, '[エラー] マイチャットでは概要を更新できません。グループチャットをご利用ください。');
       return;
     }
 
-    const roomName = getRes.data.name;
     let currentDesc = getRes.data.description || '';
-    
-    const marker = '[Gartic Phone URL]: ';
-    // 既存のURLがあるか検索する正規表現
     const regex = /\[Gartic Phone URL\]: https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}\n?/g;
-    const newLine = `${marker}${newUrl}\n`;
+    const newLine = `[Gartic Phone URL]: ${newUrl}\n`;
     
     if (currentDesc.match(regex)) {
-      // すでにURLがあれば置換（他の文章は崩さない）
-      currentDesc = currentDesc.replace(regex, newLine);
+      currentDesc = currentDesc.replace(regex, newLine); // 既存のURLを置換
     } else {
-      // なければ一番上に追加
-      currentDesc = newLine + currentDesc;
+      currentDesc = newLine + currentDesc; // 概要の先頭に追加
     }
     
-    // 概要を書き換え
-    await axios.put(`https://api.chatwork.com/v2/rooms/${roomId}`, 
-      new URLSearchParams({ name: roomName, description: currentDesc }), 
-      { headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN } }
-    );
+    // 概要の更新
+    const params = new URLSearchParams();
+    params.append('description', currentDesc);
+
+    await axios.put(`https://api.chatwork.com/v2/rooms/${roomId}`, params, { 
+      headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
+    });
+    
     console.log(`ルームの概要を更新しました: ${newUrl}`);
   } catch (err) {
-    console.error('ルーム概要更新エラー:', err.response?.data || err.message);
+    // 権限エラー(403)などの場合はチャットに通知して原因を教える
+    if (err.response && err.response.status === 403) {
+      await sendCwMessage(roomId, '[エラー] 概要を更新できませんでした。あなたのアカウントにこのルームの「管理者」権限がありません。（URLは一時的に記憶されます）');
+    } else {
+      console.error('ルーム概要更新エラー:', err.response?.data || err.message);
+    }
   }
 }
 
@@ -223,7 +238,8 @@ app.post('/webhook', async (req, res) => {
   // Bot自身の自動送信メッセージに反応しないようにする
   if (
     messageText.includes('[info][title]Gartic Phone[/title]') ||
-    messageText.includes('[info][title]完了[/title]')
+    messageText.includes('[info][title]完了[/title]') ||
+    messageText.includes('[エラー]')
   ) {
     return;
   }
@@ -238,31 +254,31 @@ app.post('/webhook', async (req, res) => {
     processedMessageIds.delete(firstItem);
   }
 
-  // URLの検知・登録・概要の書き換え（チャットへの返信は削除）
+  // ① URLを検知した場合
   const match = messageText.match(GARTIC_URL_REGEX);
   if (match) {
-    currentGarticUrl = match[0];
-    try {
-      fs.writeFileSync(URL_STORE_PATH, currentGarticUrl, 'utf-8');
-    } catch (e) {
-      console.error('URL保存エラー:', e);
-    }
-    
-    // 概要を更新（メッセージは送らない）
+    currentGarticUrl = match[0]; // メモリに保持
+    // 概要を更新（メッセージは送らない。エラーの時だけ喋る）
     await updateRoomDescription(roomId, currentGarticUrl);
     return;
   }
 
+  // ② 「開示」と言われた場合
   if (messageText.trim() === '開示') {
     if (isProcessing) {
       await sendCwMessage(roomId, '現在すでに「開示」処理を実行中です。完了までお待ちください。');
       return;
     }
-    if (!currentGarticUrl) {
+
+    // 概要欄からURLを取得・復元する（サーバー再起動対策）
+    const targetUrl = await getUrlFromDescription(roomId);
+
+    if (!targetUrl) {
       await sendCwMessage(roomId, 'URLが設定されていません。先にGartic PhoneのURLを送信してください。');
       return;
     }
-    handleGarticAlbum(roomId, currentGarticUrl);
+
+    handleGarticAlbum(roomId, targetUrl);
   }
 });
 
