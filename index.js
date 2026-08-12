@@ -25,7 +25,8 @@ app.use(express.json({
 
 let currentGarticUrl = null;
 let isProcessing = false;
-const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
+// 【修正】現在の "?c=" を含むURL仕様に対応（ハイフンなども許容）
+const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/(?:\?c=)?[a-zA-Z0-9_-]+/i;
 const processedMessageIds = new Set();
 const MAX_CACHE_SIZE = 1000;
 
@@ -81,7 +82,8 @@ async function getUrlFromDescription(roomId) {
     const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
       headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
     });
-    const match = (getRes.data.description || '').match(/\[Gartic Phone URL\]: (https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8})/);
+    // 【修正】概要からの抽出も現在のURL仕様に対応
+    const match = (getRes.data.description || '').match(/\[Gartic Phone URL\]:\s*(https?:\/\/[^\s]+\/ja\/(?:\?c=)?[a-zA-Z0-9_-]+)/i);
     if (match) {
       currentGarticUrl = match[1];
       return currentGarticUrl;
@@ -151,7 +153,7 @@ async function sendCwFile(roomId, filePath, caption = '') {
 
 // Gartic Phoneのアルバム取得メイン処理
 async function handleGarticAlbum(roomId, targetUrl) {
-  isProcessing = true;
+  // ※ここでは isProcessing = true の設定は不要（呼び出し元で設定済み）
   console.log(`Gartic Phone処理開始: ${targetUrl}`);
   await sendCwMessage(roomId, `[info][title]Gartic Phone[/title]ルームへ接続を開始します...\nURL: ${targetUrl}[/info]`);
 
@@ -205,7 +207,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
           await page.waitForTimeout(1500);
 
           if (await nameInput.isVisible()) {
-            // 【修正】いただいた画像に基づき「参加」を最優先で探す
             const startButtonSelectors = [
               'button:has-text("参加")',
               'button:has-text("開始")',
@@ -254,8 +255,8 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
     // ダウンロードの裏側で動くイベント
     page.on('download', async (download) => {
+      const downloadPath = path.join(__dirname, `gartic_dl_${Date.now()}.gif`);
       try {
-        const downloadPath = path.join(__dirname, `gartic_dl_${Date.now()}.gif`);
         await download.saveAs(downloadPath);
         const buffer = fs.readFileSync(downloadPath);
         const hash = crypto.createHash('md5').update(buffer).digest('hex');
@@ -264,9 +265,11 @@ async function handleGarticAlbum(roomId, targetUrl) {
           sentGifsHashes.add(hash);
           await sendCwFile(roomId, downloadPath, `[info]アルバムGIF (${sentGifsHashes.size}作品目)[/info]`);
         }
-        if (fs.existsSync(downloadPath)) fs.unlinkSync(downloadPath);
       } catch (err) {
         console.error('ダウンロードイベント処理エラー:', err);
+      } finally {
+        // 【修正】エラー時でも確実に一時ファイルを削除する（ストレージ枯渇対策）
+        if (fs.existsSync(downloadPath)) fs.unlinkSync(downloadPath);
       }
     });
 
@@ -279,22 +282,22 @@ async function handleGarticAlbum(roomId, targetUrl) {
         try {
           if (!(await el.isVisible())) continue;
 
-          // 【追加】すでにスクショ＆クリック済みのボタンかを判定（連写防止）
           const isProcessed = await el.evaluate(e => e.hasAttribute('data-bot-processed'));
           if (isProcessed) continue;
 
           console.log('新しいGIFボタンを発見しました。スクショとダウンロードを開始します。');
 
-          // 1. まず画面のスクリーンショットを撮って送信する
           const screenshotPath = path.join(__dirname, `screenshot_${Date.now()}.png`);
-          await page.screenshot({ path: screenshotPath });
-          await sendCwFile(roomId, screenshotPath, `[info]スクリーンショット[/info]`);
-          if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
+          try {
+            await page.screenshot({ path: screenshotPath });
+            await sendCwFile(roomId, screenshotPath, `[info]スクリーンショット[/info]`);
+          } finally {
+            // 【修正】確実にスクリーンショットを削除
+            if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
+          }
 
-          // 2. ボットが処理したという目印（マーカー）をボタンに付ける
           await el.evaluate(e => e.setAttribute('data-bot-processed', 'true'));
 
-          // 3. GIFのダウンロードを実行する
           const href = await el.getAttribute('href');
           if (href && href.includes('.gif')) {
             const absoluteHref = /^https?:\/\//i.test(href) ? href : new URL(href, page.url()).toString();
@@ -305,12 +308,15 @@ async function handleGarticAlbum(roomId, targetUrl) {
             if (!sentGifsHashes.has(hash)) {
               sentGifsHashes.add(hash);
               const savePath = path.join(__dirname, `gartic_${Date.now()}.gif`);
-              fs.writeFileSync(savePath, buffer);
-              await sendCwFile(roomId, savePath, `[info]アルバムGIF (${sentGifsHashes.size}作品目)[/info]`);
-              if (fs.existsSync(savePath)) fs.unlinkSync(savePath);
+              try {
+                fs.writeFileSync(savePath, buffer);
+                await sendCwFile(roomId, savePath, `[info]アルバムGIF (${sentGifsHashes.size}作品目)[/info]`);
+              } finally {
+                // 【修正】確実にGIFファイルを削除
+                if (fs.existsSync(savePath)) fs.unlinkSync(savePath);
+              }
             }
           } else {
-            // hrefがない場合（.GIFボタン）はクリックしてダウンロードを誘発する
             const tagName = await el.evaluate(e => e.tagName.toLowerCase());
             if (tagName === 'button') {
               await el.click({ timeout: 1000 }).catch(() => {});
@@ -358,6 +364,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
     await sendCwMessage(roomId, `エラーが発生しました: ${error.message}`);
   } finally {
     if (browser) await browser.close();
+    // 【処理終了時】確実にロック解除
     isProcessing = false;
   }
 }
@@ -403,9 +410,14 @@ app.post('/webhook', (req, res) => {
           return;
         }
 
+        // 【修正】連打対策のため、非同期通信（await getUrlFromDescription）を行う「前」にロックをかける
+        isProcessing = true;
+
         const targetUrl = currentGarticUrl || await getUrlFromDescription(roomId);
         if (!targetUrl || targetUrl.includes('今は開始していません')) {
           await sendCwMessage(roomId, 'URLが設定されていません。概要にURLがあるか確認するか、先にURLを送信してください。');
+          // 【修正】URLがなかった場合にロックを解除しないと二度と動かなくなるため解除
+          isProcessing = false;
           return;
         }
 
