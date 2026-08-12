@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// 【ステルス化】Botだとバレないための拡張機能を読み込む
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 chromium.use(stealth);
@@ -152,6 +153,19 @@ async function sendCwFile(roomId, filePath, caption = '') {
   }
 }
 
+// 安全にスクショを撮る関数（タイムアウト対策）
+async function safeScreenshot(page, savePath) {
+  try {
+    // スクショ撮影に5秒の制限時間を設け、フリーズを防ぐ
+    await page.screenshot({ path: savePath, timeout: 5000 });
+    return true;
+  } catch (e) {
+    console.log(`スクリーンショットの撮影に失敗しました (タイムアウト等): ${e.message}`);
+    return false;
+  }
+}
+
+// Gartic Phoneのアルバム取得メイン処理
 async function handleGarticAlbum(roomId, targetUrl) {
   isProcessing = true;
   console.log(`Gartic Phone処理開始: ${targetUrl}`);
@@ -178,10 +192,14 @@ async function handleGarticAlbum(roomId, targetUrl) {
     });
     const page = await context.newPage();
 
-    // 【完全自動化】ブラウザが出すダイアログは内容・言語を問わず全て無条件で「はい(Accept)」を押す
+    // 【重要】ブラウザのポップアップダイアログは全て即座に「はい(Accept)」する
     page.on('dialog', async dialog => {
-      console.log(`ダイアログ出現 -> 自動承認します`);
-      await dialog.accept().catch(() => {});
+      try {
+        console.log(`ダイアログ出現: ${dialog.type()} -> 自動承認します`);
+        await dialog.accept();
+      } catch (e) {
+        console.error('ダイアログ承認中にエラー:', e.message);
+      }
     });
 
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -191,18 +209,10 @@ async function handleGarticAlbum(roomId, targetUrl) {
     const MAX_RETRIES = 3;
 
     try {
-      const nameInput = page.locator('input').first();
+      // 入力欄を待機
+      const nameInput = page.locator('input[type="text"], input').first();
       await nameInput.waitFor({ state: 'visible', timeout: 30000 });
       await page.waitForTimeout(1000); 
-
-      // 同意ダイアログがあれば押す（コード・構造参照）
-      const consentBtns = await page.$$('button');
-      for (const btn of consentBtns) {
-        if (await btn.isVisible()) {
-          // 最下部の同意ボタンなどを適当に押してみる（外れてもOK）
-          await btn.click().catch(() => {});
-        }
-      }
 
       while (retryCount < MAX_RETRIES && !joinConfirmed) {
         retryCount++;
@@ -214,11 +224,22 @@ async function handleGarticAlbum(roomId, targetUrl) {
           await nameInput.fill('AlbumBot');
           await page.waitForTimeout(500);
 
-          await nameInput.press('Enter');
-          console.log('Enterキーを押下しました');
+          // 【完全コード参照】文字に頼らず、HTML構造（type="submit"やクラス）で参加ボタンを特定
+          const joinBtn = page.locator('button[type="submit"], button.primary, .v-button--primary, form button').first();
+          
+          if (await joinBtn.isVisible().catch(() => false)) {
+            await joinBtn.click();
+            console.log('参加ボタン（構造指定）をクリックしました');
+          } else {
+            // ボタンが見つからなければ最終手段のEnterキー
+            await nameInput.press('Enter');
+            console.log('Enterキーを押下しました');
+          }
 
+          // 画面遷移・暗転を待つ
           await page.waitForTimeout(2000);
           
+          // 入力欄が消えていれば参加成功
           if (!(await nameInput.isVisible().catch(() => false))) {
             joinConfirmed = true; 
           }
@@ -227,20 +248,25 @@ async function handleGarticAlbum(roomId, targetUrl) {
         }
       }
     } catch (e) {
-      console.log('入力欄待機エラー:', e.message);
+      console.log('入力欄の待機タイムアウト、またはエラー:', e.message);
     }
 
     if (joinConfirmed) {
-      // 成功時も状況を送信（正常に豆腐文字になっているかの確認用）
       const joinedShot = path.join(__dirname, `joined_${Date.now()}.png`);
-      await page.screenshot({ path: joinedShot });
-      await sendCwFile(roomId, joinedShot, 'Gartic Phoneへの参加を確認しました。アルバム発表を待ちます...');
-      if(fs.existsSync(joinedShot)) fs.unlinkSync(joinedShot);
+      if (await safeScreenshot(page, joinedShot)) {
+        await sendCwFile(roomId, joinedShot, 'Gartic Phoneへの参加を確認しました。監視中のBotの画面はこちらです。アルバム発表を待ちます...');
+        if(fs.existsSync(joinedShot)) fs.unlinkSync(joinedShot);
+      } else {
+        await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を待ちます...（※画面撮影はタイムアウトしました）');
+      }
     } else {
       const errorShot = path.join(__dirname, `error_${Date.now()}.png`);
-      await page.screenshot({ path: errorShot });
-      await sendCwFile(roomId, errorShot, '[エラー] 参加できませんでした。現在の画面です。処理を中断し、退室します。');
-      if(fs.existsSync(errorShot)) fs.unlinkSync(errorShot);
+      if (await safeScreenshot(page, errorShot)) {
+        await sendCwFile(roomId, errorShot, '[エラー] 参加できませんでした。現在の画面です。処理を中断し、退室します。');
+        if(fs.existsSync(errorShot)) fs.unlinkSync(errorShot);
+      } else {
+        await sendCwMessage(roomId, '[エラー] 参加できませんでした。処理を中断し、退室します。');
+      }
       return; 
     }
 
@@ -248,7 +274,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
     let isFinished = false;
     let checkCount = 0;
 
-    // ダウンロード裏側待機イベント（ここが発火すれば成功）
+    // ダウンロード裏側待機イベント
     page.on('download', async (download) => {
       try {
         console.log('ダウンロードイベント検知！保存処理開始...');
@@ -263,7 +289,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
         }
         if (fs.existsSync(downloadPath)) fs.unlinkSync(downloadPath);
       } catch (err) {
-        console.error('ダウンロードイベント処理エラー:', err);
+        console.error('ダウンロードイベント処理エラー:', err.message);
       }
     });
 
@@ -271,25 +297,26 @@ async function handleGarticAlbum(roomId, targetUrl) {
       checkCount++;
 
       try {
-        // 【完全コード参照】文字化けに影響されないように、テキストが「.GIF」を含んでいるボタンを探す
-        // （英語の「.GIF」は文字化けしないため、豆腐文字環境でも検索可能）
+        // 【完全コード参照】文字化けに影響されないように「.GIF」という英語文字列を含むボタンを探す
         const gifButtons = page.locator('button').filter({ hasText: '.GIF' });
         const btnCount = await gifButtons.count();
 
         for (let i = 0; i < btnCount; i++) {
           const btn = gifButtons.nth(i);
-          if (await btn.isVisible()) {
+          if (await btn.isVisible().catch(() => false)) {
             
+            // すでにクリック済みのボタンは無視する
             const isProcessed = await btn.evaluate(e => e.hasAttribute('data-bot-processed'));
             if (isProcessed) continue;
 
             console.log('.GIFボタンを発見しました。スクショとダウンロードを開始します。');
 
-            // 1. スクショ撮影
+            // 1. スクショ撮影（タイムアウト時はスルーして止まらない）
             const screenshotPath = path.join(__dirname, `screenshot_${Date.now()}.png`);
-            await page.screenshot({ path: screenshotPath });
-            await sendCwFile(roomId, screenshotPath, `[info]スクリーンショット[/info]`);
-            if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
+            if (await safeScreenshot(page, screenshotPath)) {
+              await sendCwFile(roomId, screenshotPath, `[info]スクリーンショット[/info]`);
+              if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
+            }
 
             // 2. マーカーを付ける
             await btn.evaluate(e => e.setAttribute('data-bot-processed', 'true'));
@@ -302,11 +329,9 @@ async function handleGarticAlbum(roomId, targetUrl) {
         console.log('ボタン検索・クリック中エラー:', e.message);
       }
 
-      // 【完全コード参照】終了判定 (文字化けに依存せず、裏側のURLが変わったかどうかだけで判定)
+      // 【完全コード参照】終了判定：URLが変わったか（ホームに戻ったか）だけで判定する
       try {
         const isUrlChanged = await page.evaluate(() => {
-          // Gartic Phoneのプレイ中URLは「/ja/8桁の部屋ID」
-          // 終わって解散やキックされると「/」や「/ja」に戻る
           const path = window.location.pathname;
           return path === '/' || path === '/ja' || path === '/en';
         });
@@ -321,7 +346,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
       await page.waitForTimeout(1000);
     }
 
-    // 抜け出せた（または時間切れになった）ら終了報告
     await sendCwMessage(roomId, `[info][title]完了[/title]アルバム処理を終了し、Botは退室しました。（合計 ${sentGifsHashes.size}件取得）[/info]`);
 
     currentGarticUrl = null;
@@ -356,6 +380,7 @@ app.post('/webhook', (req, res) => {
       const { message_id: messageId, body: messageText, room_id: roomId } = webhookEvent;
       if (!messageId || !messageText || !roomId) return;
 
+      // Bot自身の通知メッセージへの反応を防ぐ
       if (messageText.includes('[info][title]')) return;
       if (messageText.includes('[エラー]')) return;
       if (messageText.includes('[警告]')) return;
@@ -367,12 +392,14 @@ app.post('/webhook', (req, res) => {
         processedMessageIds.delete(processedMessageIds.values().next().value);
       }
 
+      // 1. URL登録処理
       const match = messageText.match(GARTIC_URL_REGEX);
       if (match) {
         currentGarticUrl = match[0];
         await updateRoomDescription(roomId, currentGarticUrl);
       }
 
+      // 2. 「開示」コマンド実行
       if (messageText.includes('開示')) {
         if (isProcessing) {
           await sendCwMessage(roomId, '現在すでに「開示」処理を実行中です。完了までお待ちください。');
