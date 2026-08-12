@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
+// 【ステルス化】Botだとバレないための拡張機能を読み込む
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 chromium.use(stealth);
@@ -152,7 +153,6 @@ async function sendCwFile(roomId, filePath, caption = '') {
   }
 }
 
-// Gartic Phoneのアルバム取得メイン処理
 async function handleGarticAlbum(roomId, targetUrl) {
   isProcessing = true;
   console.log(`Gartic Phone処理開始: ${targetUrl}`);
@@ -168,7 +168,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
         '--disable-dev-shm-usage',
         '--disable-gpu',
         '--window-size=1280,720',
-        '--disable-blink-features=AutomationControlled'
+        '--disable-blink-features=AutomationControlled' // 自動化ソフトであることを隠蔽
       ]
     });
 
@@ -176,15 +176,10 @@ async function handleGarticAlbum(roomId, targetUrl) {
       viewport: { width: 1280, height: 720 },
       acceptDownloads: true,
       locale: 'ja-JP',
+      // 人間が使っているWindows PCのChromeのフリをする
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     });
     const page = await context.newPage();
-
-    // 【重要改善1】ブラウザ標準の「ダウンロードしますか？」等に対して自動的に「はい」を押す
-    page.on('dialog', async dialog => {
-      console.log(`ダイアログ出現: ${dialog.message()} -> 自動で承認(はい)します`);
-      await dialog.accept();
-    });
 
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
@@ -241,12 +236,11 @@ async function handleGarticAlbum(roomId, targetUrl) {
       await sendCwFile(roomId, joinedShot, 'Gartic Phoneへの参加を確認しました。監視中のBotの画面はこちらです。アルバム発表を待ちます...');
       if(fs.existsSync(joinedShot)) fs.unlinkSync(joinedShot);
     } else {
-      // 【重要改善2】入室が確認できなくても、中断せずに無理やり監視ループに進む（強行突破）
       const errorShot = path.join(__dirname, `error_${Date.now()}.png`);
       await page.screenshot({ path: errorShot });
-      await sendCwFile(roomId, errorShot, '[警告] 画面上で入室完了が確認できませんでしたが、念のため監視を強行します。現在の画面です。');
+      await sendCwFile(roomId, errorShot, '[エラー] 何度か入室を試みましたが、参加できませんでした。現在の画面です。処理を中断します。');
       if(fs.existsSync(errorShot)) fs.unlinkSync(errorShot);
-      // return; を削除してそのまま進行させる
+      return; 
     }
 
     const sentGifsHashes = new Set();
@@ -272,15 +266,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
     while (!isFinished && checkCount < 600) { 
       checkCount++;
-
-      // 【重要改善3】HTML独自の「はい / Yes / OK / ダウンロード」ボタンが出た場合も自動クリックする
-      try {
-        const confirmDialogBtn = await page.$('button:has-text("はい"), button:has-text("Yes"), button:has-text("OK"), button:has-text("ダウンロードする")');
-        if (confirmDialogBtn && await confirmDialogBtn.isVisible()) {
-          console.log('画面上に確認ボタンを発見しました。自動クリックします。');
-          await confirmDialogBtn.click({ timeout: 1000 }).catch(() => {});
-        }
-      } catch (e) {}
 
       const downloadElements = await page.$$('a[download], a[href*=".gif"], button.download, button:has-text(".GIF"), button:has-text("GIF")');
 
@@ -388,7 +373,6 @@ app.post('/webhook', (req, res) => {
 
       if (messageText.includes('[info][title]')) return;
       if (messageText.includes('[エラー]')) return;
-      if (messageText.includes('[警告]')) return;
       if (messageText.includes('監視中のBotの画面はこちらです')) return;
 
       if (processedMessageIds.has(String(messageId))) return;
