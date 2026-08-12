@@ -25,7 +25,8 @@ app.use(express.json({
 
 let currentGarticUrl = null;
 let isProcessing = false;
-let myAccountId = null; // Bot自身のaccount_id（自己発火ループ防止用）
+// 独自ドメイン（プロキシ/ミラー等）を利用しているため、ドメインは限定せず
+// 「/ja/」に続く英数字8文字」というパス形式で判定する
 const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
 const processedMessageIds = new Set();
 const MAX_CACHE_SIZE = 1000;
@@ -40,38 +41,41 @@ function isValidSignature(req) {
   return signature === expectedSignature;
 }
 
-// Bot自身のaccount_idを取得（自分の発言に反応して無限ループするのを防ぐ）
-async function fetchMyAccountId() {
+// 更新直前の直近メッセージID一覧を取得する（通知メッセージ検出の基準にする）
+async function fetchRecentMessageIds(roomId) {
   try {
-    const res = await axios.get('https://api.chatwork.com/v2/me', {
+    const res = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}/messages?force=1`, {
       headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
     });
-    myAccountId = String(res.data.account_id);
-    console.log(`Bot自身のaccount_idを取得しました: ${myAccountId}`);
+    if (Array.isArray(res.data)) {
+      return new Set(res.data.map(m => String(m.message_id)));
+    }
   } catch (err) {
-    console.error('自分のaccount_id取得エラー（5秒後に再試行します）:', err.response?.data || err.message);
-    setTimeout(fetchMyAccountId, 5000);
+    console.error('直近メッセージ取得エラー:', err.response?.data || err.message);
   }
+  return new Set();
 }
 
 // 【自動削除】概要更新時にチャットワークが出す通知メッセージを消去
-async function deleteLatestSystemMessage(roomId) {
+// 文言（言語や表記）に依存させず、「更新前には無く、Bot自身が送ったのでもない、
+// 新たに増えたメッセージ」＝チャットワークが自動生成した通知、とみなして削除する。
+async function deleteDescriptionChangeNotification(roomId, beforeIds) {
   try {
     await new Promise(resolve => setTimeout(resolve, 2500)); // チャットワーク側の反映待ち
     const res = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}/messages?force=1`, {
       headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
     });
-    if (res.data && Array.isArray(res.data) && res.data.length > 0) {
-      for (let i = res.data.length - 1; i >= Math.max(0, res.data.length - 3); i--) {
-        const msg = res.data[i];
-        if (msg.body && (msg.body.includes('概要を変更しました') || msg.body.includes('Description has been changed') || msg.body.includes('[dtime:'))) {
-          await axios.delete(`https://api.chatwork.com/v2/rooms/${roomId}/messages/${msg.message_id}`, {
-            headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
-          });
-          console.log(`概要変更通知メッセージを削除しました: ${msg.message_id}`);
-          break;
-        }
-      }
+    if (!Array.isArray(res.data)) return;
+
+    for (const msg of res.data) {
+      const id = String(msg.message_id);
+      if (beforeIds.has(id)) continue;          // 更新前から既にあったメッセージ
+      if (processedMessageIds.has(id)) continue; // Bot自身が送った通常の発言（誤削除防止）
+
+      await axios.delete(`https://api.chatwork.com/v2/rooms/${roomId}/messages/${id}`, {
+        headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
+      });
+      console.log(`概要変更通知メッセージを削除しました: ${id}`);
     }
   } catch (err) {
     console.error('通知メッセージ削除エラー:', err.response?.data || err.message);
@@ -103,6 +107,9 @@ async function updateRoomDescription(roomId, newUrl) {
     });
     if (getRes.data.type === 'my') return;
 
+    // 通知メッセージ検出用に、更新前の状態を記録しておく
+    const beforeIds = await fetchRecentMessageIds(roomId);
+
     const currentDesc = getRes.data.description || '';
     const regex = /\[Gartic Phone URL\]: https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}\n?/g;
     const newLine = `[Gartic Phone URL]: ${newUrl}\n`;
@@ -118,7 +125,7 @@ async function updateRoomDescription(roomId, newUrl) {
     );
 
     // 書き換えた時に出る通知メッセージを削除
-    await deleteLatestSystemMessage(roomId);
+    await deleteDescriptionChangeNotification(roomId, beforeIds);
   } catch (err) {
     console.error('概要更新エラー:', err.response?.data || err.message);
   }
@@ -252,6 +259,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
     // 5. アルバムGIFの待機・ダウンロード処理
     const sentGifsHashes = new Set();
     const downloadedUrls = new Set();
+    const seenAlbumOwners = []; // 表示された「◯◯のアルバム」の見出しを順番に記録（一周検知用）
     let isFinished = false;
     let checkCount = 0;
 
@@ -276,8 +284,33 @@ async function handleGarticAlbum(roomId, targetUrl) {
     while (!isFinished && checkCount < 300) { // 最大15分間監視
       checkCount++;
 
-      // GIFリンクやダウンロードボタンの検知
-      const downloadElements = await page.$$('a[download], a[href*=".gif"], button.download, button:has-text("ダウンロード"), button:has-text("Download")');
+      // 「◯◯のアルバム」という見出しを読み取り、一周したら終了と判定する
+      // （画面左上の「ホーム」ボタンはアルバム表示中も常に出ているため、終了判定には使えない）
+      try {
+        const albumTitle = await page.evaluate(() => {
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode())) {
+            const text = node.textContent.trim();
+            if (text.includes('のアルバム') && text.length < 40) return text;
+          }
+          return null;
+        });
+
+        if (albumTitle) {
+          if (seenAlbumOwners.includes(albumTitle)) {
+            if (seenAlbumOwners.length > 0 && seenAlbumOwners[seenAlbumOwners.length - 1] !== albumTitle) {
+              console.log(`アルバムが一周したことを検知（${albumTitle}）。終了とみなします。`);
+              isFinished = true;
+            }
+          } else {
+            seenAlbumOwners.push(albumTitle);
+          }
+        }
+      } catch (e) {}
+
+      // GIFダウンロードボタン等の検知（実際の画面表示は「.GIF」というボタン）
+      const downloadElements = await page.$$('a[download], a[href*=".gif"], button.download, button:has-text(".GIF"), button:has-text("GIF"), button:has-text("ダウンロード"), button:has-text("Download")');
 
       for (const el of downloadElements) {
         try {
@@ -304,20 +337,14 @@ async function handleGarticAlbum(roomId, targetUrl) {
               }
             }
           } else {
-            const tagName = await el.evaluate(e => e.tagName.toLowerCase());
-            if (tagName === 'button') {
-              await el.click().catch(() => {});
-            }
+            // href を持たない「.GIF」ボタン等はクリックしてダウンロードイベントを発生させる
+            // （page.on('download') 側で受け取ってChatWorkへ送信する）
+            await el.click().catch(() => {});
           }
         } catch (e) {}
       }
 
-      // 全員のアルバム終了判定（ロビーへ戻るボタン等）
-      const endElement = await page.$('.exit, .finish, button:has-text("ロビーに戻る"), button:has-text("Home"), button:has-text("ロビー")');
-      if (endElement && sentGifsHashes.size > 0) {
-        console.log('アルバム全件の終了を検知');
-        isFinished = true;
-      }
+      if (isFinished) break;
 
       await page.waitForTimeout(3000);
     }
@@ -352,11 +379,13 @@ app.post('/webhook', (req, res) => {
       const webhookEvent = req.body.webhook_event;
       if (!webhookEvent) return;
 
-      const { message_id: messageId, body: messageText, room_id: roomId, account_id: accountId } = webhookEvent;
+      const { message_id: messageId, body: messageText, room_id: roomId } = webhookEvent;
       if (!messageId || !messageText || !roomId) return;
 
       // Bot自身が送信したメッセージは無視（自己発火ループ防止）
-      if (myAccountId && String(accountId) === myAccountId) return;
+      // ※ account_id比較はしない: 個人のAPIトークンをそのままBotとして使っている場合、
+      //   コマンドを打つ本人とBotのaccount_idが同じになり、全コマンドが無視されてしまうため。
+      //   代わりに sendCwMessage 側で記録した「Bot自身が送ったmessage_id」だけで判定する。
       if (messageText.includes('[info][title]')) return;
 
       if (processedMessageIds.has(String(messageId))) return;
@@ -403,8 +432,6 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
   console.error('未処理の例外:', err);
 });
-
-fetchMyAccountId();
 
 app.listen(PORT, () => {
   console.log(`Bot Server listening on port ${PORT}`);
