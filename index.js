@@ -18,16 +18,12 @@ app.use(express.json({
   }
 }));
 
-// URLを保存・復元するファイル
 const URL_STORE_PATH = path.join(__dirname, 'current_url.txt');
 let currentGarticUrl = null;
 
 if (fs.existsSync(URL_STORE_PATH)) {
   try {
     currentGarticUrl = fs.readFileSync(URL_STORE_PATH, 'utf-8').trim() || null;
-    if (currentGarticUrl) {
-      console.log(`保持されていたURLを読み込みました: ${currentGarticUrl}`);
-    }
   } catch (e) {
     console.error('URL読み込みエラー:', e);
   }
@@ -48,6 +44,47 @@ function isValidSignature(req) {
   return signature === expectedSignature;
 }
 
+// 【新規追加】ルームの概要(Description)を更新する関数
+async function updateRoomDescription(roomId, newUrl) {
+  try {
+    // 現在のルーム情報を取得
+    const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
+      headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
+    });
+    
+    // グループチャット以外（マイチャット等）は概要が変更できない場合があるので除外
+    if (getRes.data.type !== 'group') {
+      console.log('グループチャットではないため概要の更新をスキップします');
+      return;
+    }
+
+    const roomName = getRes.data.name;
+    let currentDesc = getRes.data.description || '';
+    
+    const marker = '[Gartic Phone URL]: ';
+    // 既存のURLがあるか検索する正規表現
+    const regex = /\[Gartic Phone URL\]: https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}\n?/g;
+    const newLine = `${marker}${newUrl}\n`;
+    
+    if (currentDesc.match(regex)) {
+      // すでにURLがあれば置換（他の文章は崩さない）
+      currentDesc = currentDesc.replace(regex, newLine);
+    } else {
+      // なければ一番上に追加
+      currentDesc = newLine + currentDesc;
+    }
+    
+    // 概要を書き換え
+    await axios.put(`https://api.chatwork.com/v2/rooms/${roomId}`, 
+      new URLSearchParams({ name: roomName, description: currentDesc }), 
+      { headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN } }
+    );
+    console.log(`ルームの概要を更新しました: ${newUrl}`);
+  } catch (err) {
+    console.error('ルーム概要更新エラー:', err.response?.data || err.message);
+  }
+}
+
 async function sendCwMessage(roomId, text) {
   try {
     await axios.post(
@@ -56,7 +93,7 @@ async function sendCwMessage(roomId, text) {
       { headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN } }
     );
   } catch (err) {
-    console.error('Chatworkメッセージ送信エラー:', err.response?.data || err.message);
+    console.error('メッセージ送信エラー:', err.response?.data || err.message);
   }
 }
 
@@ -73,28 +110,27 @@ async function sendCwFile(roomId, filePath, caption = '') {
       { headers: { ...form.getHeaders(), 'X-ChatWorkToken': CHATWORK_API_TOKEN } }
     );
   } catch (err) {
-    console.error('Chatworkファイル送信エラー:', err.response?.data || err.message);
+    console.error('ファイル送信エラー:', err.response?.data || err.message);
   }
 }
 
 async function handleGarticAlbum(roomId, targetUrl) {
   isProcessing = true;
-  console.log(`Gartic Phone処理開始: ${targetUrl}`);
+  console.log(`処理開始: ${targetUrl}`);
   await sendCwMessage(roomId, `[info][title]Gartic Phone[/title]参加処理を開始します（ブラウザ起動中...）\nURL: ${targetUrl}[/info]`);
 
   let browser;
   try {
-    // 【重要修正】Docker・小規模サーバーでクラッシュしないためのメモリ節約オプション
     browser = await chromium.launch({
       headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage', // 共有メモリの不足によるクラッシュを防止
-        '--disable-gpu',           // GPUを使わない（メモリ節約）
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
         '--disable-software-rasterizer',
-        '--mute-audio',            // 音声を無効化
-        '--single-process'         // プロセス数を最小限にする
+        '--mute-audio',
+        '--single-process'
       ]
     });
     
@@ -103,7 +139,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
     await page.goto(targetUrl, { waitUntil: 'networkidle' });
 
-    // 名前を入力して参加
     await page.waitForSelector('input[type="text"]', { timeout: 10000 });
     await page.fill('input[type="text"]', 'AlbumBot');
 
@@ -185,8 +220,8 @@ app.post('/webhook', async (req, res) => {
 
   if (!messageId || !messageText || !roomId) return;
 
+  // Bot自身の自動送信メッセージに反応しないようにする
   if (
-    messageText.includes('[info][title]URL設定[/title]') ||
     messageText.includes('[info][title]Gartic Phone[/title]') ||
     messageText.includes('[info][title]完了[/title]')
   ) {
@@ -203,6 +238,7 @@ app.post('/webhook', async (req, res) => {
     processedMessageIds.delete(firstItem);
   }
 
+  // URLの検知・登録・概要の書き換え（チャットへの返信は削除）
   const match = messageText.match(GARTIC_URL_REGEX);
   if (match) {
     currentGarticUrl = match[0];
@@ -211,7 +247,9 @@ app.post('/webhook', async (req, res) => {
     } catch (e) {
       console.error('URL保存エラー:', e);
     }
-    await sendCwMessage(roomId, `[info][title]URL設定[/title]対象のGartic Phoneを登録しました:\n${currentGarticUrl}[/info]`);
+    
+    // 概要を更新（メッセージは送らない）
+    await updateRoomDescription(roomId, currentGarticUrl);
     return;
   }
 
