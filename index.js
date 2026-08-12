@@ -18,26 +18,25 @@ app.use(express.json({
   }
 }));
 
+// 【URL引き継ぎ】再起動後も保持できるようローカルファイルにURLを保存・復元
+const URL_STORE_PATH = path.join(__dirname, 'current_url.txt');
 let currentGarticUrl = null;
-let isProcessing = false;
-let botAccountId = null; // 【追加】Bot自身のAccount IDを保持
 
+if (fs.existsSync(URL_STORE_PATH)) {
+  try {
+    currentGarticUrl = fs.readFileSync(URL_STORE_PATH, 'utf-8').trim() || null;
+    if (currentGarticUrl) {
+      console.log(`保持されていたURLを読み込みました: ${currentGarticUrl}`);
+    }
+  } catch (e) {
+    console.error('URL読み込みエラー:', e);
+  }
+}
+
+let isProcessing = false;
 const GARTIC_URL_REGEX = /https?:\/\/[^\s]+\/ja\/[a-zA-Z0-9]{8}/;
 const processedMessageIds = new Set();
 const MAX_CACHE_SIZE = 1000;
-
-// 【追加】Bot自身のAccount IDをAPIから自動取得する関数
-async function fetchBotAccountId() {
-  try {
-    const res = await axios.get('https://api.chatwork.com/v2/me', {
-      headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
-    });
-    botAccountId = res.data.account_id;
-    console.log(`Bot Account ID 取得成功: ${botAccountId}`);
-  } catch (err) {
-    console.error('Bot Account ID 取得失敗:', err.response?.data || err.message);
-  }
-}
 
 function isValidSignature(req) {
   if (!CHATWORK_WEBHOOK_TOKEN) return true;
@@ -168,6 +167,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
   } finally {
     await browser.close();
     isProcessing = false;
+    // ※ currentGarticUrl は消去せず引き継ぎ保持します
   }
 }
 
@@ -184,21 +184,19 @@ app.post('/webhook', async (req, res) => {
   const messageId = webhookEvent?.message_id;
   const messageText = webhookEvent?.body;
   const roomId = webhookEvent?.room_id;
-  const fromAccountId = webhookEvent?.from_account_id; // 【追加】送信者ID
 
   if (!messageId || !messageText || !roomId) return;
 
-  // 【自己応答防止】送信者がBot自身の場合は無視する
-  if (botAccountId && fromAccountId === botAccountId) {
+  // 【自己応答ループ防止】Botのシステム自動返信通知メッセージだけを判定して無視する
+  if (
+    messageText.includes('[info][title]URL設定[/title]') ||
+    messageText.includes('[info][title]Gartic Phone[/title]') ||
+    messageText.includes('[info][title]完了[/title]')
+  ) {
     return;
   }
 
-  // 【自己応答防止】Bot特有のシステムメッセージタグが含まれる場合も無視する
-  if (messageText.includes('[title]URL設定[/title]') || messageText.includes('[title]Gartic Phone[/title]')) {
-    return;
-  }
-
-  // 【重複防止】すでに処理済みのメッセージIDの場合は無視する
+  // 【重複防止】同じメッセージIDを既に処理していたら無視する
   if (processedMessageIds.has(messageId)) {
     return;
   }
@@ -209,10 +207,16 @@ app.post('/webhook', async (req, res) => {
     processedMessageIds.delete(firstItem);
   }
 
-  // URLの検知と設定
+  // URLの検知・登録・ファイル引き継ぎ保存
   const match = messageText.match(GARTIC_URL_REGEX);
   if (match) {
     currentGarticUrl = match[0];
+    try {
+      fs.writeFileSync(URL_STORE_PATH, currentGarticUrl, 'utf-8');
+    } catch (e) {
+      console.error('URL保存エラー:', e);
+    }
+
     await sendCwMessage(roomId, `[info][title]URL設定[/title]対象のGartic Phoneを登録しました:\n${currentGarticUrl}[/info]`);
     return;
   }
@@ -233,7 +237,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-app.listen(PORT, async () => {
+app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
-  await fetchBotAccountId(); // 起動時にBotのアカウントIDを取得
 });
