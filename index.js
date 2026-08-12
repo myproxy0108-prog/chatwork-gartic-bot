@@ -184,14 +184,12 @@ async function handleGarticAlbum(roomId, targetUrl) {
       await page.waitForSelector('input', { state: 'visible', timeout: 30000 });
       await page.waitForTimeout(1000); 
 
-      // クッキー同意ダイアログ等
       const consentBtn = await page.$('button:has-text("Consent"), button:has-text("Accept"), button:has-text("同意"), button:has-text("AGREE")');
       if (consentBtn && await consentBtn.isVisible()) {
         await consentBtn.click();
         await page.waitForTimeout(500);
       }
 
-      // 【改善】入室を数回リトライし、ダメなら諦める
       while (retryCount < MAX_RETRIES && !joinConfirmed) {
         retryCount++;
         console.log(`入室試行: ${retryCount}回目`);
@@ -207,7 +205,9 @@ async function handleGarticAlbum(roomId, targetUrl) {
           await page.waitForTimeout(1500);
 
           if (await nameInput.isVisible()) {
+            // 【修正】いただいた画像に基づき「参加」を最優先で探す
             const startButtonSelectors = [
+              'button:has-text("参加")',
               'button:has-text("開始")',
               'button:has-text("Start")',
               'button:has-text("Play")',
@@ -219,12 +219,12 @@ async function handleGarticAlbum(roomId, targetUrl) {
               const btn = await page.$(selector);
               if (btn && await btn.isVisible()) {
                 await btn.click();
+                console.log(`入室ボタンをクリックしました: ${selector}`);
                 break;
               }
             }
           }
 
-          // 入力欄が消えたか（＝確実に入室できたか）を確認
           try {
             await page.waitForFunction(() => {
               const inputs = Array.from(document.querySelectorAll('input'));
@@ -244,16 +244,15 @@ async function handleGarticAlbum(roomId, targetUrl) {
     if (joinConfirmed) {
       await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を監視中...');
     } else {
-      // 【改善】失敗時は即座に処理を中断する（留まらない）
       await sendCwMessage(roomId, '[エラー] 何度か入室を試みましたが、参加できませんでした。処理を中断し、退室します。');
       return; 
     }
 
     const sentGifsHashes = new Set();
-    const downloadedUrls = new Set();
     let isFinished = false;
     let checkCount = 0;
 
+    // ダウンロードの裏側で動くイベント
     page.on('download', async (download) => {
       try {
         const downloadPath = path.join(__dirname, `gartic_dl_${Date.now()}.gif`);
@@ -263,7 +262,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
         if (!sentGifsHashes.has(hash)) {
           sentGifsHashes.add(hash);
-          await sendCwFile(roomId, downloadPath, `アルバムGIFを取得しました (${sentGifsHashes.size}作品目)`);
+          await sendCwFile(roomId, downloadPath, `[info]アルバムGIF (${sentGifsHashes.size}作品目)[/info]`);
         }
         if (fs.existsSync(downloadPath)) fs.unlinkSync(downloadPath);
       } catch (err) {
@@ -274,34 +273,44 @@ async function handleGarticAlbum(roomId, targetUrl) {
     while (!isFinished && checkCount < 600) { 
       checkCount++;
 
-      const downloadElements = await page.$$('a[download], a[href*=".gif"], button.download, button:has-text(".GIF"), button:has-text("GIF"), button:has-text("ダウンロード"), button:has-text("Download")');
+      const downloadElements = await page.$$('a[download], a[href*=".gif"], button.download, button:has-text(".GIF"), button:has-text("GIF")');
 
       for (const el of downloadElements) {
         try {
           if (!(await el.isVisible())) continue;
 
-          const href = await el.getAttribute('href');
+          // 【追加】すでにスクショ＆クリック済みのボタンかを判定（連写防止）
+          const isProcessed = await el.evaluate(e => e.hasAttribute('data-bot-processed'));
+          if (isProcessed) continue;
 
+          console.log('新しいGIFボタンを発見しました。スクショとダウンロードを開始します。');
+
+          // 1. まず画面のスクリーンショットを撮って送信する
+          const screenshotPath = path.join(__dirname, `screenshot_${Date.now()}.png`);
+          await page.screenshot({ path: screenshotPath });
+          await sendCwFile(roomId, screenshotPath, `[info]スクリーンショット[/info]`);
+          if (fs.existsSync(screenshotPath)) fs.unlinkSync(screenshotPath);
+
+          // 2. ボットが処理したという目印（マーカー）をボタンに付ける
+          await el.evaluate(e => e.setAttribute('data-bot-processed', 'true'));
+
+          // 3. GIFのダウンロードを実行する
+          const href = await el.getAttribute('href');
           if (href && href.includes('.gif')) {
             const absoluteHref = /^https?:\/\//i.test(href) ? href : new URL(href, page.url()).toString();
+            const response = await page.request.get(absoluteHref);
+            const buffer = await response.body();
+            const hash = crypto.createHash('md5').update(buffer).digest('hex');
 
-            if (!downloadedUrls.has(absoluteHref)) {
-              downloadedUrls.add(absoluteHref);
-
-              const response = await page.request.get(absoluteHref);
-              const buffer = await response.body();
-              const hash = crypto.createHash('md5').update(buffer).digest('hex');
-
-              if (!sentGifsHashes.has(hash)) {
-                sentGifsHashes.add(hash);
-                const savePath = path.join(__dirname, `gartic_${Date.now()}.gif`);
-                fs.writeFileSync(savePath, buffer);
-
-                await sendCwFile(roomId, savePath, `アルバムGIFを取得しました (${sentGifsHashes.size}作品目)`);
-                if (fs.existsSync(savePath)) fs.unlinkSync(savePath);
-              }
+            if (!sentGifsHashes.has(hash)) {
+              sentGifsHashes.add(hash);
+              const savePath = path.join(__dirname, `gartic_${Date.now()}.gif`);
+              fs.writeFileSync(savePath, buffer);
+              await sendCwFile(roomId, savePath, `[info]アルバムGIF (${sentGifsHashes.size}作品目)[/info]`);
+              if (fs.existsSync(savePath)) fs.unlinkSync(savePath);
             }
           } else {
+            // hrefがない場合（.GIFボタン）はクリックしてダウンロードを誘発する
             const tagName = await el.evaluate(e => e.tagName.toLowerCase());
             if (tagName === 'button') {
               await el.click({ timeout: 1000 }).catch(() => {});
