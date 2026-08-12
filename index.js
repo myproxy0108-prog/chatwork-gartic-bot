@@ -57,8 +57,6 @@ async function fetchRecentMessageIds(roomId) {
 }
 
 // 【自動削除】概要更新時にチャットワークが出す通知メッセージを消去
-// 文言（言語や表記）に依存させず、「更新前には無く、Bot自身が送ったのでもない、
-// 新たに増えたメッセージ」＝チャットワークが自動生成した通知、とみなして削除する。
 async function deleteDescriptionChangeNotification(roomId, beforeIds) {
   try {
     await new Promise(resolve => setTimeout(resolve, 2500)); // チャットワーク側の反映待ち
@@ -69,8 +67,8 @@ async function deleteDescriptionChangeNotification(roomId, beforeIds) {
 
     for (const msg of res.data) {
       const id = String(msg.message_id);
-      if (beforeIds.has(id)) continue;          // 更新前から既にあったメッセージ
-      if (processedMessageIds.has(id)) continue; // Bot自身が送った通常の発言（誤削除防止）
+      if (beforeIds.has(id)) continue;
+      if (processedMessageIds.has(id)) continue;
 
       await axios.delete(`https://api.chatwork.com/v2/rooms/${roomId}/messages/${id}`, {
         headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN }
@@ -82,7 +80,7 @@ async function deleteDescriptionChangeNotification(roomId, beforeIds) {
   }
 }
 
-// 概要欄からURLを自動復元（Render再起動・スリープ対策）
+// 概要欄からURLを自動復元
 async function getUrlFromDescription(roomId) {
   try {
     const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
@@ -99,7 +97,7 @@ async function getUrlFromDescription(roomId) {
   return null;
 }
 
-// 概要の最上部を書き換える（URLに限らず、完了時の「今は開始していません！」なども同じ関数で書き換える）
+// 概要の最上部を書き換える
 async function updateRoomDescription(roomId, newContent) {
   try {
     const getRes = await axios.get(`https://api.chatwork.com/v2/rooms/${roomId}`, {
@@ -107,16 +105,11 @@ async function updateRoomDescription(roomId, newContent) {
     });
     if (getRes.data.type === 'my') return;
 
-    // 通知メッセージ検出用に、更新前の状態を記録しておく
     const beforeIds = await fetchRecentMessageIds(roomId);
-
     const currentDesc = getRes.data.description || '';
-    // 「[Gartic Phone URL]: 」で始まる行は内容を問わず(URLでもプレースホルダーの文言でも)対象にする
     const regex = /\[Gartic Phone URL\]: .*\n?/g;
     const newLine = `[Gartic Phone URL]: ${newContent}\n`;
 
-    // 既存の行は（どこにあっても）一旦取り除き、本文はそのまま保持したうえで
-    // 新しい内容を必ず一番上に追記する
     const bodyWithoutOldLine = currentDesc.replace(regex, '');
     const updatedDesc = newLine + bodyWithoutOldLine;
 
@@ -125,7 +118,6 @@ async function updateRoomDescription(roomId, newContent) {
       { headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN } }
     );
 
-    // 書き換えた時に出る通知メッセージを削除
     await deleteDescriptionChangeNotification(roomId, beforeIds);
   } catch (err) {
     console.error('概要更新エラー:', err.response?.data || err.message);
@@ -139,8 +131,6 @@ async function sendCwMessage(roomId, text) {
       new URLSearchParams({ body: text }),
       { headers: { 'X-ChatWorkToken': CHATWORK_API_TOKEN } }
     );
-    // 自分が送ったメッセージIDを既処理済みとして記録し、Webhookで再度拾って
-    // 「開示」などのキーワードに反応してしまう自己発火ループを防ぐ
     if (res.data && res.data.message_id) {
       processedMessageIds.add(String(res.data.message_id));
     }
@@ -191,9 +181,9 @@ async function handleGarticAlbum(roomId, targetUrl) {
 
     // 1. ページを開く
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(3000); // 描画安定待機
+    await page.waitForTimeout(3000); 
 
-    // 2. クッキー同意ダイアログ等があれば自動で閉じる
+    // 2. クッキー同意ダイアログ等
     try {
       const consentBtn = await page.$('button:has-text("Consent"), button:has-text("Accept"), button:has-text("同意")');
       if (consentBtn) await consentBtn.click();
@@ -210,7 +200,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
       console.log('ニックネーム欄なし（初期名で続行）');
     }
 
-    // 4. 【重要】「開始」ボタンを探してクリック
+    // 4. 「開始」ボタンを探してクリック
     const startButtonSelectors = [
       'button:has-text("開始")',
       'button:has-text("Start")',
@@ -226,19 +216,14 @@ async function handleGarticAlbum(roomId, targetUrl) {
       if (btn && await btn.isVisible()) {
         await btn.click();
         clicked = true;
-        console.log(`開始ボタンをクリックしました: ${selector}`);
         break;
       }
     }
 
     if (!clicked) {
-      // 見つからなかった場合はEnterキーを押下
       await page.keyboard.press('Enter');
     }
 
-    // 4.5 実際に入室できたかを検証する（名前入力欄・開始ボタンが消えたかどうかを判定材料にする）
-    // ここを確認せずに「参加完了」と言い切ってしまうと、実際は入室に失敗していても
-    // 成功したと誤報してしまうため、必ず検証してから発言内容を分ける。
     let joinConfirmed = false;
     try {
       await page.waitForFunction(() => {
@@ -254,13 +239,12 @@ async function handleGarticAlbum(roomId, targetUrl) {
     if (joinConfirmed) {
       await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を監視中...');
     } else {
-      await sendCwMessage(roomId, '「開始」の操作は行いましたが、実際に入室できたかは確認できませんでした。念のため監視は継続しますが、入室に失敗している場合はアルバムを取得できません。手動でルームの状態をご確認ください。');
+      await sendCwMessage(roomId, '「開始」の操作は行いましたが、実際に入室できたかは確認できませんでした。監視は継続します。');
     }
 
-    // 5. アルバムGIFの待機・ダウンロード処理
+    // 5. 【改善】アルバムGIFの待機・ダウンロード処理
     const sentGifsHashes = new Set();
     const downloadedUrls = new Set();
-    const seenAlbumOwners = []; // 表示された「◯◯のアルバム」の見出しを順番に記録（一周検知用）
     let isFinished = false;
     let checkCount = 0;
 
@@ -282,43 +266,20 @@ async function handleGarticAlbum(roomId, targetUrl) {
       }
     });
 
-    while (!isFinished && checkCount < 300) { // 最大15分間監視
+    // 最大10分間監視 (待機時間を 1秒 に短縮して超高速化)
+    while (!isFinished && checkCount < 600) { 
       checkCount++;
 
-      // 「◯◯のアルバム」という見出しを読み取り、一周したら終了と判定する
-      // （画面左上の「ホーム」ボタンはアルバム表示中も常に出ているため、終了判定には使えない）
-      try {
-        const albumTitle = await page.evaluate(() => {
-          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-          let node;
-          while ((node = walker.nextNode())) {
-            const text = node.textContent.trim();
-            if (text.includes('のアルバム') && text.length < 40) return text;
-          }
-          return null;
-        });
-
-        if (albumTitle) {
-          if (seenAlbumOwners.includes(albumTitle)) {
-            if (seenAlbumOwners.length > 0 && seenAlbumOwners[seenAlbumOwners.length - 1] !== albumTitle) {
-              console.log(`アルバムが一周したことを検知（${albumTitle}）。終了とみなします。`);
-              isFinished = true;
-            }
-          } else {
-            seenAlbumOwners.push(albumTitle);
-          }
-        }
-      } catch (e) {}
-
-      // GIFダウンロードボタン等の検知（実際の画面表示は「.GIF」というボタン）
       const downloadElements = await page.$$('a[download], a[href*=".gif"], button.download, button:has-text(".GIF"), button:has-text("GIF"), button:has-text("ダウンロード"), button:has-text("Download")');
 
       for (const el of downloadElements) {
         try {
+          // 【高速化】見えていないボタンは無視し、無駄な処理を省く
+          if (!(await el.isVisible())) continue;
+
           const href = await el.getAttribute('href');
 
           if (href && href.includes('.gif')) {
-            // 相対URLの場合は現在のページURLを基準に絶対URLへ変換
             const absoluteHref = /^https?:\/\//i.test(href) ? href : new URL(href, page.url()).toString();
 
             if (!downloadedUrls.has(absoluteHref)) {
@@ -338,21 +299,53 @@ async function handleGarticAlbum(roomId, targetUrl) {
               }
             }
           } else {
-            // href を持たない「.GIF」ボタン等はクリックしてダウンロードイベントを発生させる
-            // （page.on('download') 側で受け取ってChatWorkへ送信する）
-            await el.click().catch(() => {});
+            // 見えているボタンならサクッとクリックしてダウンロードを促す
+            const tagName = await el.evaluate(e => e.tagName.toLowerCase());
+            if (tagName === 'button') {
+              await el.click({ timeout: 1000 }).catch(() => {});
+            }
           }
         } catch (e) {}
       }
 
-      if (isFinished) break;
+      // 【改善】終了判定：アルバムが終わり、プレイヤーがロビーに戻ったか解散したかを即座に判定
+      try {
+        const shouldFinish = await page.evaluate(() => {
+          const bodyText = document.body.innerText.toUpperCase();
+          
+          // ホストがロビーに戻った、または解散・切断された特有の文字
+          if (bodyText.includes('ロビーに戻る') || bodyText.includes('PLAY AGAIN') || bodyText.includes('接続が切断されました')) {
+            return true;
+          }
+          // URLがホームに戻っている
+          if (window.location.pathname === '/' || window.location.pathname === '/ja') {
+            return true;
+          }
+          // 画面中央に大きく「HOME」や「ホーム」ボタンが出た（解散時）
+          const buttons = Array.from(document.querySelectorAll('button'));
+          for (const btn of buttons) {
+            const btnText = (btn.textContent || '').toUpperCase();
+            if ((btnText.includes('HOME') || btnText.includes('ホーム')) && btn.offsetHeight > 30) {
+              return true;
+            }
+          }
+          return false;
+        });
 
-      await page.waitForTimeout(3000);
+        if (shouldFinish) {
+          console.log('アルバム終了（みんなが抜けた状態）を検知しました');
+          isFinished = true;
+          break;
+        }
+      } catch (e) {}
+
+      // 【高速化】チェック間隔を3秒から「1秒」に短縮
+      await page.waitForTimeout(1000);
     }
 
     await sendCwMessage(roomId, `[info][title]完了[/title]全員のアルバム取得が完了しました。Botは退室します。（合計 ${sentGifsHashes.size}件）[/info]`);
 
-    // お開き（完了）になったので、概要のURL部分を「今は開始していません！」に書き換える
+    // お開きになったので、概要のURL部分を「今は開始していません！」に書き換える
     currentGarticUrl = null;
     await updateRoomDescription(roomId, '今は開始していません！');
 
@@ -370,8 +363,6 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook', (req, res) => {
-  // Webhookは3秒以内にレスポンスを返す必要があるため、先に200を返し
-  // 実処理は非同期で行う（例外はここでキャッチしてサーバーを落とさない）
   res.status(200).send('OK');
 
   (async () => {
@@ -387,10 +378,6 @@ app.post('/webhook', (req, res) => {
       const { message_id: messageId, body: messageText, room_id: roomId } = webhookEvent;
       if (!messageId || !messageText || !roomId) return;
 
-      // Bot自身が送信したメッセージは無視（自己発火ループ防止）
-      // ※ account_id比較はしない: 個人のAPIトークンをそのままBotとして使っている場合、
-      //   コマンドを打つ本人とBotのaccount_idが同じになり、全コマンドが無視されてしまうため。
-      //   代わりに sendCwMessage 側で記録した「Bot自身が送ったmessage_id」だけで判定する。
       if (messageText.includes('[info][title]')) return;
 
       if (processedMessageIds.has(String(messageId))) return;
@@ -399,14 +386,14 @@ app.post('/webhook', (req, res) => {
         processedMessageIds.delete(processedMessageIds.values().next().value);
       }
 
-      // 1. URL検知 (概要を更新し、通知は自動削除)
+      // 1. URL検知
       const match = messageText.match(GARTIC_URL_REGEX);
       if (match) {
         currentGarticUrl = match[0];
         await updateRoomDescription(roomId, currentGarticUrl);
       }
 
-      // 2. 「開示」判定 (メッセージに含まれていれば実行)
+      // 2. 「開示」判定
       if (messageText.includes('開示')) {
         if (isProcessing) {
           await sendCwMessage(roomId, '現在すでに「開示」処理を実行中です。完了までお待ちください。');
@@ -414,7 +401,7 @@ app.post('/webhook', (req, res) => {
         }
 
         const targetUrl = currentGarticUrl || await getUrlFromDescription(roomId);
-        if (!targetUrl) {
+        if (!targetUrl || targetUrl.includes('今は開始していません')) {
           await sendCwMessage(roomId, 'URLが設定されていません。概要にURLがあるか確認するか、先にURLを送信してください。');
           return;
         }
@@ -430,7 +417,6 @@ app.post('/webhook', (req, res) => {
   })();
 });
 
-// 想定外のエラーでプロセスが落ちてBotが完全停止しないようにする
 process.on('unhandledRejection', (reason) => {
   console.error('未処理のPromise拒否:', reason);
 });
