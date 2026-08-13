@@ -157,13 +157,16 @@ async function sendCwFile(roomId, filePath, caption = '') {
   }
 }
 
-// 安全にスクショを撮る関数（タイムアウト対策）
+// 【超強化】絶対に止まらないスクショ撮影（5秒で強制タイムアウトさせる）
 async function safeScreenshot(page, savePath) {
   try {
-    await page.screenshot({ path: savePath, timeout: 5000 });
+    await Promise.race([
+      page.screenshot({ path: savePath }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('スクショ強制タイムアウト (5秒)')), 5000))
+    ]);
     return true;
   } catch (e) {
-    console.log(`スクリーンショットの撮影に失敗しました (タイムアウト等): ${e.message}`);
+    console.log(`スクリーンショット撮影をスキップしました: ${e.message}`);
     return false;
   }
 }
@@ -172,7 +175,7 @@ async function safeScreenshot(page, savePath) {
 async function handleGarticAlbum(roomId, targetUrl) {
   isProcessing = true;
   
-  // 【超重要】Botがアクセスする時は文字化け（豆腐）を防ぐためにURLを強制的に /en/ に変換する！
+  // Botがアクセスする時は文字化け（豆腐）を防ぐためにURLを強制的に /en/ に変換する
   const enUrl = targetUrl.replace(/\/(ja|en)\//, '/en/');
   
   console.log(`Gartic Phone処理開始: ${targetUrl} (※Botは英語UI ${enUrl} でアクセスします)`);
@@ -195,14 +198,12 @@ async function handleGarticAlbum(roomId, targetUrl) {
     const context = await browser.newContext({
       viewport: { width: 1280, height: 720 },
       acceptDownloads: true,
-      // 英語のUIを引き出すために言語をen-USに設定
       locale: 'en-US',
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     });
     const page = await context.newPage();
 
-    // 【GIFダウンロード強化】ブラウザのポップアップダイアログは全て即座に「はい(Accept)」する
-    // 英語環境だと「Download the image?」等になりますが、問答無用で承認します。
+    // ダイアログは全て即座に「はい(Accept)」
     page.on('dialog', async dialog => {
       try {
         console.log(`ダイアログ出現: ${dialog.message()} -> 即座に自動承認します`);
@@ -212,7 +213,6 @@ async function handleGarticAlbum(roomId, targetUrl) {
       }
     });
 
-    // 変換した英語のURLにアクセス
     await page.goto(enUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
     let joinConfirmed = false;
@@ -225,13 +225,21 @@ async function handleGarticAlbum(roomId, targetUrl) {
       await nameInput.waitFor({ state: 'visible', timeout: 30000 });
       await page.waitForTimeout(1000); 
 
-      // 英語UIのため、同意ボタンは確実に「Consent」「Accept」になるので押しやすい
-      const consentBtn = page.locator('button').filter({ hasText: /Consent|Accept|AGREE/i }).first();
-      if (await consentBtn.isVisible().catch(() => false)) {
-        await consentBtn.click();
-        await page.waitForTimeout(500);
+      // クッキー同意ダイアログ処理
+      const consentButtons = page.locator('button');
+      for (let i = 0; i < await consentButtons.count(); i++) {
+        const btn = consentButtons.nth(i);
+        if (await btn.isVisible().catch(() => false)) {
+          const text = await btn.textContent();
+          if (/Consent|Accept|Agree|Got it|OK/i.test(text)) {
+            await btn.click({ timeout: 2000 }).catch(() => {});
+            await page.waitForTimeout(500);
+            break;
+          }
+        }
       }
 
+      // 【完全対応】入室リトライループ
       while (retryCount < MAX_RETRIES && !joinConfirmed) {
         retryCount++;
         console.log(`入室試行: ${retryCount}回目`);
@@ -242,16 +250,32 @@ async function handleGarticAlbum(roomId, targetUrl) {
           await nameInput.fill('AlbumBot');
           await page.waitForTimeout(500);
 
-          // 英語UIになったので、文字化けせず確実に「Start」や「Play」が読める！
-          const joinBtn = page.locator('button, [role="button"]').filter({ hasText: /Start|Play/i }).first();
+          let clicked = false;
+          // あらゆるボタン(button, a, role="button")を総当たりして、条件に合うものを探す
+          const buttons = page.locator('button, [role="button"], a');
+          const count = await buttons.count();
           
-          if (await joinBtn.isVisible().catch(() => false)) {
-            await joinBtn.click();
-            console.log('英語の「Start/Play」ボタンをクリックしました');
-          } else {
-            // 見つからなければEnterキー
+          for (let i = 0; i < count; i++) {
+            const btn = buttons.nth(i);
+            if (await btn.isVisible().catch(() => false)) {
+              const text = (await btn.textContent() || '').trim();
+              const type = (await btn.getAttribute('type') || '').toLowerCase();
+              const className = (await btn.getAttribute('class') || '').toLowerCase();
+              
+              // テキストがJoin, Start, Playのいずれか、またはsubmitボタン、またはprimaryクラスなら押す
+              if (/Join|Start|Play|参加|開始/i.test(text) || type === 'submit' || className.includes('primary')) {
+                await btn.click({ timeout: 3000 }).catch(() => {});
+                console.log(`入室ボタンをクリックしました (Text: ${text}, Type: ${type})`);
+                clicked = true;
+                break;
+              }
+            }
+          }
+
+          // ボタンが見つからなければ、最終手段として確実に入力欄でEnterを叩く
+          if (!clicked) {
             await nameInput.press('Enter');
-            console.log('Enterキーを押下しました');
+            console.log('入室ボタンが見つからなかったため、Enterキーを押下しました');
           }
 
           // 画面遷移・暗転を待つ
@@ -275,7 +299,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
         await sendCwFile(roomId, joinedShot, 'Gartic Phoneへの参加を確認しました。監視中のBotの画面はこちらです。(※文字化け対策のため英語モードで起動しています)');
         if(fs.existsSync(joinedShot)) fs.unlinkSync(joinedShot);
       } else {
-        await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を待ちます...（※画面撮影はタイムアウトしました）');
+        await sendCwMessage(roomId, 'Gartic Phoneへの参加を確認しました。アルバム発表を待ちます...（※画面撮影はタイムアウトでスキップしました）');
       }
     } else {
       const errorShot = path.join(__dirname, `error_${Date.now()}.png`);
@@ -292,7 +316,7 @@ async function handleGarticAlbum(roomId, targetUrl) {
     let isFinished = false;
     let checkCount = 0;
 
-    // ダウンロード裏側待機イベント（ここでGIFが取得できれば一番安全）
+    // ダウンロード裏側待機イベント
     page.on('download', async (download) => {
       try {
         console.log('ダウンロードイベント検知！保存処理開始...');
